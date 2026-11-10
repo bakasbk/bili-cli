@@ -162,6 +162,35 @@ def _wait_deadline(wait: int) -> float | None:
     return None if limit is None else max(limit, wait + 120)
 
 
+def _auto_register_current_home(mid: int | None, bname: str | None) -> None:
+    """Best-effort: make the directory `home()` currently points at known to the account registry.
+
+    If an account already maps to this directory we just refresh its cached
+    mid/name. Otherwise we synthesize a name from the directory's last path
+    segment and register it (so `bili account list` shows it). Never overrides
+    an explicit BILI_CLI_HOME-based session in a destructive way.
+    """
+    try:
+        current = str(config.home().resolve())
+    except Exception:
+        return
+    reg = config.load_registry()
+    for nm, acct in reg.get("accounts", {}).items():
+        if acct.get("home") and str(Path(acct["home"]).resolve()) == current:
+            if mid is not None or bname is not None:
+                config.touch_account_meta(nm, mid, bname)
+            return
+    # Not yet registered: derive a name from the directory leaf and add it.
+    leaf = Path(current).name
+    name = leaf if leaf else "default"
+    if name in reg.get("accounts", {}):
+        return
+    try:
+        config.register_account(name, current, mid, bname)
+    except Exception:
+        return
+
+
 @app.command()
 def login(
     qr_out: Optional[Path] = typer.Option(
@@ -236,6 +265,9 @@ def status(
         if refresh_error:
             result["refresh_error"] = refresh_error
             result["hint"] = "登录目前仍有效，只是这次没能续期。稍后再运行 `bili auth status`；一直失败的话，等登录过期后用 `bili auth login` 重新扫码。"
+        # Auto-register the current home() directory as an account so `bili account list/use` works.
+        user_info = result["user"]
+        _auto_register_current_home(user_info.get("mid"), user_info.get("name"))
         return result
 
     run(body, deadline=_wait_deadline(wait))

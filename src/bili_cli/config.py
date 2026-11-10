@@ -20,15 +20,144 @@ CREDENTIAL_FIELDS = ("sessdata", "bili_jct", "buvid3", "buvid4", "dedeuserid", "
 
 
 def home() -> Path:
+    # BILI_CLI_HOME always wins (kept for backward compatibility and explicit overrides).
     env = os.environ.get("BILI_CLI_HOME")
     if env:
         path = Path(env)
-    elif sys.platform == "win32":
-        path = Path(os.environ.get("APPDATA", Path.home())) / "bili-cli"
     else:
-        path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "bili-cli"
+        selected = _selected_account_home()
+        if selected is not None:
+            path = selected
+        elif sys.platform == "win32":
+            path = Path(os.environ.get("APPDATA", Path.home())) / "bili-cli"
+        else:
+            path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "bili-cli"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+# --------------------------------------------------------------------------- #
+# Multi-account registry
+#
+# The registry lives in the *default* home (the one you get with no
+# BILI_CLI_HOME) so a single machine can hold several named accounts, each in
+# its own directory. Selecting an account just points `home()` at that
+# directory. This is purely a convenience layer over the existing
+# per-directory isolation: it never loops over accounts or runs anything in
+# parallel, and BILI_CLI_HOME still overrides everything.
+# --------------------------------------------------------------------------- #
+
+def registry_path() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home())) / "bili-cli"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "bili-cli"
+    return base / "accounts.json"
+
+
+def load_registry() -> dict[str, Any]:
+    data = _read_json(registry_path()) or {}
+    data.setdefault("default", None)
+    data.setdefault("accounts", {})
+    return data
+
+
+def save_registry(data: dict[str, Any]) -> None:
+    registry_path().parent.mkdir(parents=True, exist_ok=True)
+    _write_private(registry_path(), data)
+
+
+def _selected_account_home() -> Path | None:
+    """The home directory of the currently selected account, or None if none."""
+    reg = load_registry()
+    name = reg.get("default")
+    acct = reg.get("accounts", {}).get(name) if name else None
+    if not acct:
+        return None
+    home_dir = acct.get("home")
+    return Path(home_dir) if home_dir else None
+
+
+def register_account(name: str, home_dir: str | None, mid: int | None = None, bname: str | None = None) -> dict[str, Any]:
+    """Add or update an account entry; returns the updated registry."""
+    reg = load_registry()
+    if not home_dir:
+        if sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA", Path.home())) / "bili-cli"
+        else:
+            base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "bili-cli"
+        home_dir = str(base / "accounts" / name)
+    reg.setdefault("accounts", {})[name] = {
+        "home": home_dir,
+        "mid": mid,
+        "name": bname,
+    }
+    if not reg.get("default"):
+        reg["default"] = name
+    save_registry(reg)
+    return reg
+
+
+def select_account(name: str) -> None:
+    reg = load_registry()
+    if name not in reg.get("accounts", {}):
+        raise BiliError("invalid_argument", f"账号「{name}」不存在。", hint="先用 `bili account add {name}` 添加，或 `bili account list` 查看已有账号。")
+    reg["default"] = name
+    save_registry(reg)
+
+
+def unregister_account(name: str, keep_default: bool = False) -> dict[str, Any]:
+    reg = load_registry()
+    if name not in reg.get("accounts", {}):
+        raise BiliError("invalid_argument", f"账号「{name}」不存在。")
+    del reg["accounts"][name]
+    if reg.get("default") == name and not keep_default:
+        reg["default"] = next(iter(reg["accounts"]), None)
+    save_registry(reg)
+    return reg
+
+
+def touch_account_meta(name: str, mid: int | None = None, bname: str | None = None) -> None:
+    """Update an account's cached mid/name without disturbing the rest of the registry."""
+    reg = load_registry()
+    acct = reg.get("accounts", {}).get(name)
+    if not acct:
+        return
+    if mid is not None:
+        acct["mid"] = mid
+    if bname is not None:
+        acct["name"] = bname
+    save_registry(reg)
+
+
+class env_home_override:
+    """Temporarily point ``home()`` at ``path`` for the duration of a ``with`` block.
+
+    Used by ``bili account list`` to probe each account's login state without
+    mutating the caller's environment. BILI_CLI_HOME (a real env var) still
+    wins if it is set, matching ``home()``'s precedence.
+    """
+
+    def __init__(self, path: str | None):
+        self._path = path
+        self._prev = None
+        self._active = False
+
+    def __enter__(self):
+        if self._path is None:
+            return self
+        self._prev = os.environ.get("BILI_CLI_HOME")
+        os.environ["BILI_CLI_HOME"] = str(self._path)
+        self._active = True
+        return self
+
+    def __exit__(self, *exc):
+        if self._active:
+            if self._prev is None:
+                os.environ.pop("BILI_CLI_HOME", None)
+            else:
+                os.environ["BILI_CLI_HOME"] = self._prev
+            self._active = False
 
 
 def state_home() -> Path:
